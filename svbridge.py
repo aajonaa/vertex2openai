@@ -92,7 +92,7 @@ class Credential:
 class CredentialPool:
     """Manages multiple credentials with round-robin cycling"""
     credentials: list[Credential] = field(default_factory=list)
-    current_index: int = 0
+    current_index: int = -1
     lock: RLock = field(default_factory=RLock)
 
     def add(self, cred: Credential):
@@ -108,26 +108,37 @@ class CredentialPool:
         if not self.credentials:
             return None
         with self.lock:
+            if self.current_index < 0:
+                return None
             return self.credentials[self.current_index]
 
-    def rotate(self) -> Credential | None:
-        """Rotate to next credential and return it"""
+    def next_credential(self) -> Credential | None:
+        """Atomically advance and return the next credential"""
         if not self.credentials:
             return None
         with self.lock:
             self.current_index = (self.current_index + 1) % len(self.credentials)
             cred = self.credentials[self.current_index]
-            logger.info(f"[Pool] Rotated to credential {self.current_index + 1}/{len(self.credentials)}: {os.path.basename(cred.file_path)}")
+            logger.info(
+                f"[Pool] Rotated to credential {self.current_index + 1}/{len(self.credentials)}: {os.path.basename(cred.file_path)}"
+            )
             return cred
+
+    def rotate(self) -> Credential | None:
+        """Rotate to next credential and return it"""
+        return self.next_credential()
 
     def get_token(self) -> tuple[str, str] | tuple[None, None]:
         """Get token from current credential, returns (token, project_id)"""
-        cred = self.get_current()
-        if not cred:
+        if not self.credentials:
             return None, None
-        token = cred.get_token()
-        if token:
-            return token, cred.project_id
+        for _ in range(len(self.credentials)):
+            cred = self.next_credential()
+            if not cred:
+                return None, None
+            token = cred.get_token()
+            if token and cred.project_id:
+                return token, cred.project_id
         return None, None
 
     def refresh_all(self):
@@ -308,25 +319,37 @@ async def chat_completions(request: Request):
 
     body = await request.body()
 
+    retryable_statuses = {401, 403, 404, 429, 500, 502, 503, 504}
+
     # Try each credential in round-robin fashion
     num_credentials = credential_pool.count()
     if num_credentials == 0:
         raise HTTPException(status_code=500, detail="No credentials available")
 
-    last_error = None
+    last_error_body: bytes | None = None
+    last_error_status: int | None = None
+    last_error_media_type: str = "application/json"
     for attempt in range(num_credentials):
-        token, project_id = credential_pool.get_token()
+        cred = credential_pool.next_credential()
+        if not cred:
+            break
+
+        token = cred.get_token()
+        project_id = cred.project_id
         if not token or not project_id:
-            logger.warning(f"[Proxy] Credential {attempt + 1} has no valid token, rotating...")
-            credential_pool.rotate()
+            logger.warning(
+                f"[Proxy] Credential {attempt + 1} has no valid token, trying next..."
+            )
+            last_error_status = 500
+            last_error_body = b'{"error":"credential missing token or project_id"}'
+            last_error_media_type = "application/json"
             continue
 
         target = get_endpoint_url(project_id)
         if request.url.query:
             target += f"?{request.url.query}"
 
-        cred = credential_pool.get_current()
-        cred_name = os.path.basename(cred.file_path) if cred else "unknown"
+        cred_name = os.path.basename(cred.file_path)
         logger.info(f"[Proxy] Attempt {attempt + 1}/{num_credentials} using {cred_name}")
         logger.info(f"[Proxy] {request.method} {target}")
 
@@ -348,19 +371,17 @@ async def chat_completions(request: Request):
                     status_code = resp.status_code
                     media_type = resp.headers.get("content-type") or "application/json"
 
-                    # Check for rate limit error
-                    if status_code == 429:
+                    if status_code in retryable_statuses:
                         error_body = await resp.aread()
-                        logger.warning(f"[Proxy] Got 429 from {cred_name}, rotating to next credential...")
-                        credential_pool.rotate()
-                        last_error = error_body
+                        logger.warning(
+                            f"[Proxy] Got {status_code} from {cred_name}, trying next credential..."
+                        )
+                        last_error_status = status_code
+                        last_error_body = error_body
+                        last_error_media_type = media_type
                         continue
 
                     # Success or other error - return response
-                    async def stream_response():
-                        async for chunk in resp.aiter_bytes():
-                            yield chunk
-
                     # We need to collect the response since we're in a context manager
                     chunks = []
                     async for chunk in resp.aiter_bytes():
@@ -378,17 +399,18 @@ async def chat_completions(request: Request):
 
         except httpx.RequestError as e:
             logger.error(f"[Proxy] Request error with {cred_name}: {e}")
-            credential_pool.rotate()
-            last_error = str(e)
+            last_error_status = 502
+            last_error_body = str(e).encode()
+            last_error_media_type = "text/plain"
             continue
 
     # All credentials exhausted
     logger.error("[Proxy] All credentials exhausted")
-    if last_error:
+    if last_error_status is not None and last_error_body is not None:
         return StreamingResponse(
-            iter([last_error if isinstance(last_error, bytes) else last_error.encode()]),
-            status_code=429,
-            media_type="application/json",
+            iter([last_error_body]),
+            status_code=last_error_status,
+            media_type=last_error_media_type or "application/json",
         )
     raise HTTPException(status_code=500, detail="All credentials failed")
 
