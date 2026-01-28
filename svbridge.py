@@ -278,22 +278,25 @@ async def chat_completions(request: Request):
     headers["Authorization"] = f"Bearer {token}"
 
     async def stream_with_header():
-        assert http_client
-        async with http_client.stream(
-            request.method,
-            target,
-            headers=headers,
-            content=body,
-        ) as resp:
-            yield resp.status_code, resp.headers.get("content-type")
+        # Use a fresh client for each request to avoid stale connection issues
+        async with httpx.AsyncClient(http2=True, timeout=httpx.Timeout(300.0)) as client:
+            async with client.stream(
+                request.method,
+                target,
+                headers=headers,
+                content=body,
+            ) as resp:
+                yield resp.status_code, resp.headers.get("content-type")
 
-            async for chunk in resp.aiter_bytes():
-                yield chunk
+                async for chunk in resp.aiter_bytes():
+                    yield chunk
 
     ait = stream_with_header()
     status_code, media_type = await ait.__anext__()
     assert isinstance(status_code, int)
-    assert isinstance(media_type, str)
+    assert isinstance(media_type, str) or media_type is None
+    if media_type is None:
+        media_type = "application/json"
 
     async def stream_wrapper():
         async for chunk in ait:
