@@ -325,7 +325,7 @@ async def models(request: Request):
         retry_request(
             http_client,
             publisher,
-            f"https://{LOCATION}-aiplatform.googleapis.com/v1beta1/publishers/{publisher}/models",
+            f"https://us-central1-aiplatform.googleapis.com/v1beta1/publishers/{publisher}/models",
             headers={
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {token}",
