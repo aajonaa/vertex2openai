@@ -1,4 +1,5 @@
 import os
+import glob as glob_module
 import argparse
 import json
 import asyncio
@@ -7,6 +8,7 @@ import logging.config
 from datetime import datetime, timedelta, timezone
 from threading import RLock
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 
 import httpx
 import uvicorn
@@ -21,14 +23,11 @@ DEFAULT_CONFIG: dict[str, str | bool | int | None] = {
     "port": 8086,
     "bind": "localhost",
     "key": "",
-    "access_token": None,
-    "token_expiry": None,
     "auto_refresh": True,
     "filter_model_names": True,
 }
 
 LOCATION = "global"
-PROJECT_ID = None  # to be set on startup
 ENDPOINT_ID = "openapi"
 PUBLISHERS = (
     "google",
@@ -45,6 +44,105 @@ TOKEN_EXPIRY_BUFFER = timedelta(minutes=10)
 BACKGROUND_INTERVAL = 5  # minutes
 
 
+@dataclass
+class Credential:
+    """Represents a single Google Cloud credential"""
+    file_path: str
+    project_id: str | None = None
+    access_token: str | None = None
+    token_expiry: datetime | None = None
+
+    def is_valid(self) -> bool:
+        """Check if token is valid"""
+        if not self.access_token or not self.token_expiry:
+            return False
+        now = datetime.now(timezone.utc)
+        return now < (self.token_expiry - TOKEN_EXPIRY_BUFFER)
+
+    def refresh(self) -> bool:
+        """Refresh the token for this credential"""
+        from google.auth import load_credentials_from_file
+        from google.auth.transport.requests import Request
+
+        try:
+            credentials, project = load_credentials_from_file(
+                self.file_path,
+                scopes=["https://www.googleapis.com/auth/cloud-platform"]
+            )
+            credentials.refresh(Request())
+            self.access_token = credentials.token
+            self.token_expiry = credentials.expiry.replace(tzinfo=timezone.utc)
+            if not self.project_id:
+                self.project_id = project
+            logger.info(f"[Credential] Refreshed token for {os.path.basename(self.file_path)} (project: {self.project_id})")
+            return True
+        except Exception as e:
+            logger.error(f"[Credential] Failed to refresh {os.path.basename(self.file_path)}: {e}")
+            return False
+
+    def get_token(self) -> str | None:
+        """Get valid token, refresh if needed"""
+        if not self.is_valid():
+            if not self.refresh():
+                return None
+        return self.access_token
+
+
+@dataclass
+class CredentialPool:
+    """Manages multiple credentials with round-robin cycling"""
+    credentials: list[Credential] = field(default_factory=list)
+    current_index: int = 0
+    lock: RLock = field(default_factory=RLock)
+
+    def add(self, cred: Credential):
+        """Add a credential to the pool"""
+        self.credentials.append(cred)
+
+    def count(self) -> int:
+        """Number of credentials in pool"""
+        return len(self.credentials)
+
+    def get_current(self) -> Credential | None:
+        """Get current credential"""
+        if not self.credentials:
+            return None
+        with self.lock:
+            return self.credentials[self.current_index]
+
+    def rotate(self) -> Credential | None:
+        """Rotate to next credential and return it"""
+        if not self.credentials:
+            return None
+        with self.lock:
+            self.current_index = (self.current_index + 1) % len(self.credentials)
+            cred = self.credentials[self.current_index]
+            logger.info(f"[Pool] Rotated to credential {self.current_index + 1}/{len(self.credentials)}: {os.path.basename(cred.file_path)}")
+            return cred
+
+    def get_token(self) -> tuple[str, str] | tuple[None, None]:
+        """Get token from current credential, returns (token, project_id)"""
+        cred = self.get_current()
+        if not cred:
+            return None, None
+        token = cred.get_token()
+        if token:
+            return token, cred.project_id
+        return None, None
+
+    def refresh_all(self):
+        """Refresh all credentials"""
+        for cred in self.credentials:
+            cred.refresh()
+
+
+# Global state
+credential_pool = CredentialPool()
+config: dict[str, str | bool | int | None] = {}
+token_lock = RLock()
+http_client: httpx.AsyncClient | None = None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan event to load config on startup"""
@@ -55,11 +153,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 router = APIRouter()
-token_lock = RLock()
-config: dict[str, str | bool | int | None] = {}
 logging.config.dictConfig(LOGGING_CONFIG)
 logger: logging.Logger = logging.getLogger("uvicorn")
-http_client: httpx.AsyncClient | None = None  # Reusable httpx client
 
 
 def load_config():
@@ -99,86 +194,56 @@ def save_config():
             logger.error(f"[Config] Failed to save config: {e}")
 
 
-def get_gcloud_project_id() -> str:
-    """Get the gcloud project ID"""
-    from google.auth import default
+def discover_credentials() -> list[str]:
+    """Discover credential JSON files in current directory"""
+    # Look for service account JSON files (exclude config file)
+    json_files = glob_module.glob("*.json")
+    credential_files = []
 
-    # If this fails, you need to set up gcloud authentication
-    _, project_id = default()
-    assert project_id, "Project ID not found, please set up gcloud authentication"
-    return project_id
+    for f in json_files:
+        if f == CONFIG_FILE:
+            continue
+        try:
+            with open(f, "r") as fp:
+                data = json.load(fp)
+                # Check if it looks like a service account file
+                if data.get("type") == "service_account" and "private_key" in data:
+                    credential_files.append(f)
+        except (json.JSONDecodeError, KeyError):
+            continue
 
-
-def generate_gcloud_token() -> tuple[str, datetime] | tuple[None, None]:
-    """Get a new token using gcloud sdk"""
-    from google.auth import default
-    from google.auth.transport.requests import Request
-
-    try:
-        credentials, _ = default(
-            scopes=["https://www.googleapis.com/auth/cloud-platform"]
-        )
-        credentials.refresh(Request())
-        token = credentials.token
-        expiry = credentials.expiry.replace(tzinfo=timezone.utc)
-        return token, expiry
-    except Exception as e:
-        logger.error(f"[Token] Failed to fetch token: {e}")
-        return None, None
+    return sorted(credential_files)
 
 
-def is_valid() -> bool:
-    """Check whether the local token exists and is not expired (with buffer)"""
-    with token_lock:
-        token = config.get("access_token")
-        exp = config.get("token_expiry")
-    if not token or not exp:
-        logger.info("[Token] Token invalid: missing token or expiry")
-        return False
-    try:
-        assert isinstance(token, str)
-        assert isinstance(exp, str)
-        expiry = datetime.fromisoformat(exp)
-        if expiry.tzinfo is None:
-            expiry = expiry.replace(tzinfo=timezone.utc)
-        now = datetime.now(timezone.utc)
-        if now < (expiry - TOKEN_EXPIRY_BUFFER):
-            logger.info(f"[Token] Token valid until {expiry}")
-            return True
-        logger.info(f"[Token] Token expired at {expiry}")
-        return False
-    except ValueError as e:
-        logger.error(f"[Token] Invalid expiry format: {e}")
-        return False
+def init_credential_pool():
+    """Initialize the credential pool from discovered files or env var"""
+    global credential_pool
 
+    # Check for GOOGLE_APPLICATION_CREDENTIALS env var first
+    env_cred = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+    if env_cred and os.path.exists(env_cred):
+        cred = Credential(file_path=env_cred)
+        if cred.refresh():
+            credential_pool.add(cred)
+            logger.info(f"[Pool] Added credential from env: {os.path.basename(env_cred)}")
 
-def refresh_token(force=False):
-    """Refresh token"""
-    with token_lock:
-        if force or not is_valid():
-            new_token, new_exp = generate_gcloud_token()
-            if new_token and new_exp:
-                config["access_token"] = new_token
-                config["token_expiry"] = new_exp.isoformat()
-                save_config()
-                logger.info("[Token] Token refreshed")
-                return True
-            logger.error("[Token] Token refresh failed")
-            return False
-        logger.info("[Token] No refresh needed")
-        return True
+    # Discover additional credentials in current directory
+    discovered = discover_credentials()
+    for cred_file in discovered:
+        # Skip if already added from env
+        abs_path = os.path.abspath(cred_file)
+        if env_cred and os.path.abspath(env_cred) == abs_path:
+            continue
 
+        cred = Credential(file_path=abs_path)
+        if cred.refresh():
+            credential_pool.add(cred)
+            logger.info(f"[Pool] Added credential: {cred_file} (project: {cred.project_id})")
 
-def get_token():
-    """Get current token, refresh when expired"""
-    with token_lock:
-        if not is_valid():
-            logger.warning("[Token] Token expired, forcing refresh")
-            if not refresh_token(force=True):
-                logger.error("[Token] Failed to get token")
-                return None
-        logger.info("[Token] Token retrieved successfully")
-        return config.get("access_token")
+    if credential_pool.count() == 0:
+        logger.error("[Pool] No valid credentials found!")
+    else:
+        logger.info(f"[Pool] Initialized with {credential_pool.count()} credential(s)")
 
 
 async def verify_token(authorization: str | None = Header(None)):
@@ -210,13 +275,13 @@ async def root():
     return "Hello, this is Simple Vertex Bridge! UwU"
 
 
-def get_endpoint_url() -> str:
+def get_endpoint_url(project_id: str) -> str:
     """Get the Vertex AI endpoint URL"""
     if LOCATION == "global":
         # Global region uses different URL format (no region prefix on domain)
         return (
             f"https://aiplatform.googleapis.com/v1"
-            f"/projects/{PROJECT_ID}"
+            f"/projects/{project_id}"
             f"/locations/{LOCATION}"
             f"/endpoints/{ENDPOINT_ID}"
             f"/chat/completions"
@@ -225,7 +290,7 @@ def get_endpoint_url() -> str:
         # Regional endpoint
         return (
             f"https://{LOCATION}-aiplatform.googleapis.com/v1"
-            f"/projects/{PROJECT_ID}"
+            f"/projects/{project_id}"
             f"/locations/{LOCATION}"
             f"/endpoints/{ENDPOINT_ID}"
             f"/chat/completions"
@@ -238,66 +303,103 @@ def get_endpoint_url() -> str:
     dependencies=[Depends(verify_token)],
 )
 async def chat_completions(request: Request):
-    """Proxy to Vertex AI with Bearer token"""
+    """Proxy to Vertex AI with Bearer token and round-robin failover"""
     logger.info(f"[Proxy] Received request: {request.url.path}")
-    token = get_token()
-    if not token:
-        logger.error("[Proxy] No valid token for proxy request")
-        raise HTTPException(status_code=500, detail="Failed to obtain token")
 
     body = await request.body()
-    target = get_endpoint_url()
-    if request.url.query:
-        target += f"?{request.url.query}"
-    logger.info(f"[Proxy] {request.method} {target}")
 
-    headers = {
-        key: value
-        for key, value in request.headers.items()
-        if key.lower() not in ("host", "authorization", "content-length")
-    }
-    headers["Authorization"] = f"Bearer {token}"
+    # Try each credential in round-robin fashion
+    num_credentials = credential_pool.count()
+    if num_credentials == 0:
+        raise HTTPException(status_code=500, detail="No credentials available")
 
-    async def stream_with_header():
-        # Use a fresh client for each request to avoid stale connection issues
-        async with httpx.AsyncClient(http2=True, timeout=httpx.Timeout(300.0)) as client:
-            async with client.stream(
-                request.method,
-                target,
-                headers=headers,
-                content=body,
-            ) as resp:
-                yield resp.status_code, resp.headers.get("content-type")
+    last_error = None
+    for attempt in range(num_credentials):
+        token, project_id = credential_pool.get_token()
+        if not token or not project_id:
+            logger.warning(f"[Proxy] Credential {attempt + 1} has no valid token, rotating...")
+            credential_pool.rotate()
+            continue
 
-                async for chunk in resp.aiter_bytes():
-                    yield chunk
+        target = get_endpoint_url(project_id)
+        if request.url.query:
+            target += f"?{request.url.query}"
 
-    ait = stream_with_header()
-    status_code, media_type = await ait.__anext__()
-    assert isinstance(status_code, int)
-    assert isinstance(media_type, str) or media_type is None
-    if media_type is None:
-        media_type = "application/json"
+        cred = credential_pool.get_current()
+        cred_name = os.path.basename(cred.file_path) if cred else "unknown"
+        logger.info(f"[Proxy] Attempt {attempt + 1}/{num_credentials} using {cred_name}")
+        logger.info(f"[Proxy] {request.method} {target}")
 
-    async def stream_wrapper():
-        async for chunk in ait:
-            assert isinstance(chunk, bytes)
-            yield chunk
+        headers = {
+            key: value
+            for key, value in request.headers.items()
+            if key.lower() not in ("host", "authorization", "content-length")
+        }
+        headers["Authorization"] = f"Bearer {token}"
 
-    return StreamingResponse(
-        stream_wrapper(),
-        status_code=status_code,
-        media_type=media_type,
-    )
+        try:
+            async with httpx.AsyncClient(http2=True, timeout=httpx.Timeout(300.0)) as client:
+                async with client.stream(
+                    request.method,
+                    target,
+                    headers=headers,
+                    content=body,
+                ) as resp:
+                    status_code = resp.status_code
+                    media_type = resp.headers.get("content-type") or "application/json"
+
+                    # Check for rate limit error
+                    if status_code == 429:
+                        error_body = await resp.aread()
+                        logger.warning(f"[Proxy] Got 429 from {cred_name}, rotating to next credential...")
+                        credential_pool.rotate()
+                        last_error = error_body
+                        continue
+
+                    # Success or other error - return response
+                    async def stream_response():
+                        async for chunk in resp.aiter_bytes():
+                            yield chunk
+
+                    # We need to collect the response since we're in a context manager
+                    chunks = []
+                    async for chunk in resp.aiter_bytes():
+                        chunks.append(chunk)
+
+                    async def yield_chunks():
+                        for chunk in chunks:
+                            yield chunk
+
+                    return StreamingResponse(
+                        yield_chunks(),
+                        status_code=status_code,
+                        media_type=media_type,
+                    )
+
+        except httpx.RequestError as e:
+            logger.error(f"[Proxy] Request error with {cred_name}: {e}")
+            credential_pool.rotate()
+            last_error = str(e)
+            continue
+
+    # All credentials exhausted
+    logger.error("[Proxy] All credentials exhausted")
+    if last_error:
+        return StreamingResponse(
+            iter([last_error if isinstance(last_error, bytes) else last_error.encode()]),
+            status_code=429,
+            media_type="application/json",
+        )
+    raise HTTPException(status_code=500, detail="All credentials failed")
 
 
 @router.api_route("/models", methods=["GET"], dependencies=[Depends(verify_token)])
 async def models(request: Request):
     """Fetches available models from Vertex and returns them in OpenAI format"""
-    assert PROJECT_ID
     logger.info(f"[Models] Received request: {request.url.path}")
-    token = get_token()
-    if not token:
+
+    token, project_id = credential_pool.get_token()
+    if not token or not project_id:
         logger.error("[Models] No valid token for models request")
         raise HTTPException(status_code=500, detail="Failed to obtain token")
 
@@ -329,7 +431,7 @@ async def models(request: Request):
             headers={
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {token}",
-                "x-goog-user-project": PROJECT_ID,
+                "x-goog-user-project": project_id,
             },
         )
         for publisher in PUBLISHERS
@@ -399,10 +501,8 @@ async def startup_event():
     http_client = httpx.AsyncClient(http2=True, timeout=None)
     logger.info("[HTTPClient] Created reusable client")
 
-    global PROJECT_ID
-    logger.info("[Google] Getting default project ID...")
-    PROJECT_ID = get_gcloud_project_id()
-    logger.info(f"[Google] Project ID: {PROJECT_ID}")
+    # Initialize credential pool
+    init_credential_pool()
 
     load_config()
     if config.get("auto_refresh"):
@@ -410,9 +510,8 @@ async def startup_event():
             f"[Background] Started checking token every {BACKGROUND_INTERVAL} minutes"
         )
         scheduler = BackgroundScheduler()
-        scheduler.add_job(refresh_token, "interval", minutes=BACKGROUND_INTERVAL)
+        scheduler.add_job(credential_pool.refresh_all, "interval", minutes=BACKGROUND_INTERVAL)
         scheduler.start()
-        refresh_token()  # Run once immediately
 
 
 async def shutdown_event():
