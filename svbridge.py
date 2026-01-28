@@ -28,6 +28,9 @@ DEFAULT_CONFIG: dict[str, str | bool | int | None] = {
 }
 
 LOCATION = "us-central1"
+GLOBAL_MODELS = (
+    "gemini-3-",  # Gemini 3 models are only available in global region
+)
 PROJECT_ID = None  # to be set on startup
 ENDPOINT_ID = "openapi"
 PUBLISHERS = (
@@ -210,6 +213,36 @@ async def root():
     return "Hello, this is Simple Vertex Bridge! UwU"
 
 
+def is_global_model(model_name: str) -> bool:
+    """Check if a model requires the global region endpoint"""
+    # Extract model name from publisher/model format
+    if "/" in model_name:
+        model_name = model_name.split("/", 1)[1]
+    return any(model_name.startswith(prefix) for prefix in GLOBAL_MODELS)
+
+
+def get_endpoint_url(model_name: str | None = None) -> str:
+    """Get the appropriate endpoint URL based on model"""
+    if model_name and is_global_model(model_name):
+        # Global region uses different URL format (no region prefix on domain)
+        return (
+            f"https://aiplatform.googleapis.com/v1"
+            f"/projects/{PROJECT_ID}"
+            f"/locations/global"
+            f"/endpoints/{ENDPOINT_ID}"
+            f"/chat/completions"
+        )
+    else:
+        # Regional endpoint
+        return (
+            f"https://{LOCATION}-aiplatform.googleapis.com/v1"
+            f"/projects/{PROJECT_ID}"
+            f"/locations/{LOCATION}"
+            f"/endpoints/{ENDPOINT_ID}"
+            f"/chat/completions"
+        )
+
+
 @router.api_route(
     "/chat/completions",
     methods=["GET", "POST"],
@@ -223,13 +256,16 @@ async def chat_completions(request: Request):
         logger.error("[Proxy] No valid token for proxy request")
         raise HTTPException(status_code=500, detail="Failed to obtain token")
 
-    target = (
-        f"https://{LOCATION}-aiplatform.googleapis.com/v1"
-        f"/projects/{PROJECT_ID}"
-        f"/locations/{LOCATION}"
-        f"/endpoints/{ENDPOINT_ID}"
-        f"/chat/completions"
-    )
+    # Parse request body to get model name
+    body = await request.body()
+    model_name = None
+    try:
+        body_json = json.loads(body)
+        model_name = body_json.get("model")
+    except (json.JSONDecodeError, AttributeError):
+        pass
+
+    target = get_endpoint_url(model_name)
     if request.url.query:
         target += f"?{request.url.query}"
     logger.info(f"[Proxy] {request.method} {target}")
@@ -240,8 +276,6 @@ async def chat_completions(request: Request):
         if key.lower() not in ("host", "authorization", "content-length")
     }
     headers["Authorization"] = f"Bearer {token}"
-
-    body = await request.body()
 
     async def stream_with_header():
         assert http_client
